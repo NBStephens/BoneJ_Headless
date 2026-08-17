@@ -1,6 +1,7 @@
 # @CommandService cs
 #@ DatasetIOService io
 #@ UIService ui
+#@ ConvertService convertService
 # @Context ctxt
 
 #@ String image
@@ -16,6 +17,7 @@ import os
 
 
 from net.imagej import ImgPlus
+from net.imagej import Dataset
 from net.imagej.axis import Axes
 from net.imglib2.img import Img
 from net.imagej import DefaultDataset
@@ -24,28 +26,35 @@ from io.scif.img import ImgOpener
 from org.bonej.utilities import SharedTable
 from ij import ImagePlus
 from ij.io import FileSaver
-#Prevents unicode error 
+#Prevents unicode error
 import sys
 reload(sys)
 sys.setdefaultencoding('utf-8')
-#Open image from path 
+#Open image from path
 outputdir
 
-#open input image as IJ1-style image to be compatabile with wrapper  
-#IJ.run("Clear BoneJ results");
+# hops patch (2026-08-13): current BoneJ's ThicknessWrapper (shared by both the
+# Thickness and Spacing metrics) needs `inputDataset` (net.imagej.Dataset), not
+# `inputImage` (ImagePlus) — and process=True, not False, or the
+# @Parameter(validater=...) on inputDataset never runs and the field stays null
+# (see Area_VolumeFraction's identical fix for the mechanism). Loading through
+# `io.open()` (DatasetIOService) directly drops NRRD voxel calibration (every
+# axis comes back unit=None, scale=1.0) — IJ.open() reads it correctly, and
+# ConvertService preserves it onto the Dataset the wrapper needs.
 IJ.run("Clear BoneJ results");
 IJ.open(image)
-input_Image = IJ.getImage() # BoneJ2 Thickness wrapper requires IJ1 image data, ImagePlus
-input_image_ij1 = IJ.run(input_Image,"Multiply...", "value=255 stack"); 
+imp = IJ.getImage()
+dataset = convertService.convert(imp, Dataset)
 
-
-#Run Trabecular Thickness Plugin specifying parameters 
-wrapper = cs.run("org.bonej.wrapperPlugins.ThicknessWrapper", False, ["inputImage",input_Image, "mapChoice",mapChoice,"showMaps",showMaps,"maskArtefacts",maskArtefacts])
+wrapper = cs.run("org.bonej.wrapperPlugins.ThicknessWrapper", True,
+    ["inputDataset", dataset, "mapChoice", mapChoice, "showMaps", showMaps == "True", "maskArtefacts", maskArtefacts == "True"])
 wrapperInstance = wrapper.get()
-#Call trabecular spacing map and save
-spacing_tif = wrapperInstance.getOutput("spacingMap")
-#spacing_map.show()
-IJ.save(spacing_tif, outputdir +"spacing.tif")
+# hops patch: the output field is now `separationMap` (a Dataset), not the old
+# `spacingMap` (an ImagePlus) — and it's saved via DatasetIOService (io.save),
+# not the legacy IJ.save which expects an ImagePlus.
+separationMap = wrapperInstance.getOutput("separationMap")
+if separationMap is not None:
+    io.save(separationMap, outputdir + "spacing.tif")
 
 table = SharedTable.getTable()
 # print(table)

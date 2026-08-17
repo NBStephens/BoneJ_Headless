@@ -1,14 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import nrrd
-import numpy as np 
-import csv 
+import numpy as np
+import csv
 import os
-import subprocess 
-import tempfile 
-import matplotlib.pyplot as plt 
+import subprocess
+import tempfile
+import matplotlib.pyplot as plt
 import tifffile as tiff
-        
+
+
+def _run_fiji_and_read_table(fiji_cmd, table_csv_path):
+    """hops patch (2026-08-13): the original code discarded Fiji's own
+    stdout/stderr unconditionally (`subprocess.call(..., stdout=DEVNULL,
+    stderr=DEVNULL)`) and never checked its exit code, then just tried to open
+    the results CSV — so any failure inside Fiji, for any reason, surfaced only
+    as an opaque `FileNotFoundError` on a file that was never written, with zero
+    indication of what actually went wrong. Capturing the output here means that
+    class of failure is diagnosable from the error message alone instead of
+    requiring a live macro re-run to find out what Fiji actually said.
+    """
+    result = subprocess.run(fiji_cmd, shell=True, capture_output=True, text=True)
+    if not os.path.exists(table_csv_path):
+        raise RuntimeError(
+            "Fiji did not produce {} (exit code {}).\n"
+            "--- Fiji stdout (last 4000 chars) ---\n{}\n"
+            "--- Fiji stderr (last 4000 chars) ---\n{}".format(
+                table_csv_path, result.returncode, result.stdout[-4000:], result.stderr[-4000:]
+            )
+        )
+    with open(table_csv_path, "r", encoding='utf-8') as file:
+        reader = csv.reader(file)
+        metric_dict = {row[0]: row[1:] for row in reader if row and row[0]}
+    return {key: value[0].strip('"') for key, value in metric_dict.items()}
+
+
 def Thickness(array,voxel_size,fiji_path,showMaps = True, maskArtefacts = True):
     
     if not isinstance(array, np.ndarray) or array.dtype != np.uint8:
@@ -48,25 +74,12 @@ def Thickness(array,voxel_size,fiji_path,showMaps = True, maskArtefacts = True):
                      ", maskArtefacts="+"\""+maskArtefacts+"\"",
                      ", table_csv="+"\""+table_csv+"\""+"\'"])
 
-    b = subprocess.call(fiji_cmd, shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    
- 
-    with open(outputdir+f"table.csv", "r", encoding='utf-8') as file:
-        reader = csv.reader(file)
-        metric_dict = {row[0]: row[1:] for row in reader if row and row[0]}  
-       
-    clean_metric_dict = {
-        key: value[0].strip('"')
-        for key, value in metric_dict.items()
-    }
-
-    for idx, (key, value) in enumerate (clean_metric_dict.items()):
-        if idx ==0:
+    clean_metric_dict = _run_fiji_and_read_table(fiji_cmd, outputdir + "table.csv")
+    for idx, (key, value) in enumerate(clean_metric_dict.items()):
+        if idx == 0:
             continue
         print(key + ":", value)
 
-    
-    
     if showMaps=="True":
         thickness_tif = outputdir +"thickness.tif"
         thickness_tif=tiff.imread(thickness_tif)
@@ -92,7 +105,13 @@ def Spacing(array,voxel_size,fiji_path,showMaps = True, maskArtefacts = True):
         print("Error: The input array is not binary.")
         return 
      
-    mapChoice = "Trabecular spacing"
+    # hops patch (2026-08-13): current BoneJ's ThicknessWrapper (which handles
+    # both Thickness and Spacing via mapChoice) renamed this option from
+    # "Trabecular spacing" to "Trabecular separation" — the old string no longer
+    # matches any case in the wrapper's getMapOptions() and throws
+    # IllegalArgumentException("Unexpected map choice"). See the macro for the
+    # rest of this fix (inputDataset, process=True, calibration-preserving load).
+    mapChoice = "Trabecular separation"
     showMaps = str(showMaps)
     maskArtefacts = str(maskArtefacts)
     tempdir = tempfile.TemporaryDirectory()
@@ -102,9 +121,16 @@ def Spacing(array,voxel_size,fiji_path,showMaps = True, maskArtefacts = True):
     outputdir = os.path.join(tempdir.name, "outputdir")
     macro_file = os.path.abspath(os.path.join(os.path.dirname(__file__),"Macros/Trabecular_Spacing_API_Test.py"))
 
-    
+
     # save to temporary directory
-    header = {'units': ['um', 'um', 'um'],'spacings': voxel_size}
+    # hops patch (2026-08-13): raw encoding, not pynrrd's default gzip — see
+    # Area_VolumeFraction's identical fix for why (SCIFI's NRRD reader can't
+    # read gzip-encoded files). Unit string is 'micrometer', not the 'um'
+    # abbreviation used everywhere else in this file — ThicknessWrapper's
+    # isotropy check (which ElementFractionWrapper doesn't have) does a real
+    # cross-axis UDUNITS conversion, and 'um' isn't parseable there (crashes with
+    # a NullPointerException deep in ucar.units); the spelled-out name is.
+    header = {'units': ['micrometer', 'micrometer', 'micrometer'],'spacings': voxel_size,'encoding':'raw'}
 
     nrrd.write(data1_nrrd,array,header)
 
@@ -117,34 +143,21 @@ def Spacing(array,voxel_size,fiji_path,showMaps = True, maskArtefacts = True):
                      ", mapChoice="+"\""+mapChoice+"\"",
                      ", table_csv="+"\""+table_csv+"\""+"\'"])
 
-    b = subprocess.call(fiji_cmd, shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    
+    clean_metric_dict = _run_fiji_and_read_table(fiji_cmd, outputdir + "table.csv")
+    for idx, (key, value) in enumerate(clean_metric_dict.items()):
+        if idx == 0:
+            continue
+        print(key + ":", value)
 
-    with open(outputdir+f"table.csv", "r", encoding='utf-8') as file:
-        reader = csv.reader(file)
-        metric_dict = {row[0]:row[1:] for row in reader if row and row[0]}
-        
-        clean_metric_dict = {
-            key: value[0].strip('"')
-            for key, value in metric_dict.items()
-        }
+    if showMaps == "True":
+        spacing_tif = outputdir + "spacing.tif"
+        spacing_tif = tiff.imread(spacing_tif)
+        z_center = spacing_tif.shape[2] // 2
+        plt.figure();plt.imshow(spacing_tif[:, :, z_center])
+        plt.title("spacing map")
+        plt.axis("off")
+        plt.show()
 
-        for idx, (key, value) in enumerate (clean_metric_dict.items()):
-            if idx ==0:
-                continue
-            print(key + ":", value)
-                
-        
-        if showMaps=="True":
-            spacing_tif = outputdir +"spacing.tif"
-            spacing_tif=tiff.imread(spacing_tif)
-            z_center = spacing_tif.shape[2] // 2
-            plt.figure();plt.imshow(spacing_tif[:, :, z_center])
-            plt.title("spacing map")
-            plt.axis("off")
-            plt.show()
-        
-        
     return clean_metric_dict, spacing_tif
 
             
@@ -190,26 +203,15 @@ def Anisotropy(array,voxel_size,fiji_path,NDirs = 2000, nLines = 10000, sampling
                          ", outputdir="+"\""+outputdir+"\"",
                          ", table_csv="+"\""+table_csv+"\""+"\'"])
 
-    b = subprocess.call(fiji_cmd, shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    with open(outputdir+f"table.csv", "r", encoding='utf-8') as file:
-        reader = csv.reader(file)
-        metric_dict = {row[0]:row[1:] for row in reader if row and row[0]}
-
-        clean_metric_dict = {
-            key: value[0].strip('"')
-            for key, value in metric_dict.items()
-        }
-
-        for idx, (key, value) in enumerate (clean_metric_dict.items()):
-            if idx ==0:
-                continue
-            print(key + ":", value)        
-
-      
+    clean_metric_dict = _run_fiji_and_read_table(fiji_cmd, outputdir + "table.csv")
+    for idx, (key, value) in enumerate(clean_metric_dict.items()):
+        if idx == 0:
+            continue
+        print(key + ":", value)
 
     return clean_metric_dict
 
-        
+
 
 def Connectivity(array,voxel_size,fiji_path):
     if not isinstance(array, np.ndarray) or array.dtype != np.uint8:
@@ -241,21 +243,13 @@ def Connectivity(array,voxel_size,fiji_path):
                          ", outputdir="+"\""+outputdir+"\"",
                          ", table_csv="+"\""+table_csv+"\""+"\'"])
 
-    b = subprocess.call(fiji_cmd, shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    with open(outputdir+f"table.csv", "r", encoding='utf-8') as file:
-        reader = csv.reader(file)
-        metric_dict = {row[0]:row[1:] for row in reader if row and row[0]}
-        clean_metric_dict = {
-            key: value[0].strip('"')
-            for key, value in metric_dict.items()
-        }
-
-        for idx, (key, value) in enumerate (clean_metric_dict.items()):
-            if idx ==0:
-                continue
-            print(key + ":", value)                  
+    clean_metric_dict = _run_fiji_and_read_table(fiji_cmd, outputdir + "table.csv")
+    for idx, (key, value) in enumerate(clean_metric_dict.items()):
+        if idx == 0:
+            continue
+        print(key + ":", value)
     return clean_metric_dict
-    
+
 def Area_VolumeFraction(array,voxel_size,fiji_path):
     if not isinstance(array, np.ndarray) or array.dtype != np.uint8:
         print("Error: The input array is not an 8-bit array.")
@@ -275,30 +269,28 @@ def Area_VolumeFraction(array,voxel_size,fiji_path):
     macro_file = os.path.abspath(os.path.join(os.path.dirname(__file__),"Macros/Area_VolumeFraction_API_Test.py"))
     
     # save to temporary directory
-    header = {'units': ['um', 'um', 'um'],'spacings': voxel_size}
+    # hops patch (2026-08-12): pynrrd defaults to gzip-encoding NRRD files
+    # (compression_level=0 only lowers the gzip level, it does NOT switch the
+    # header's `encoding` field to raw), but the macro now loads the file via
+    # DatasetIOService (io.open in the Jython macro) instead of the legacy IJ1
+    # opener, and SCIFI's NRRD reader doesn't support gzip encoding at all
+    # (UnsupportedCompressionException) — explicit 'encoding': 'raw' is required.
+    header = {'units': ['um', 'um', 'um'],'spacings': voxel_size,'encoding':'raw'}
 
     nrrd.write(data1_nrrd,array,header)
-    
-    
-    fiji_cmd = "".join([fiji_path, " --ij2", " --headless", " --run", " "+macro_file, 
-                         " \'image="+"\""+data1_nrrd+"\"",  
+
+
+    fiji_cmd = "".join([fiji_path, " --ij2", " --headless", " --run", " "+macro_file,
+                         " \'image="+"\""+data1_nrrd+"\"",
                          ", outputdir="+"\""+outputdir+"\"",
                          ", table_csv="+"\""+table_csv+"\""+"\'"])
 
-    b = subprocess.call(fiji_cmd, shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    with open(outputdir+f"table.csv", "r", encoding='utf-8') as file:
-        reader = csv.reader(file)
-        metric_dict = {row[0]:row[1:] for row in reader if row and row[0]}
-        clean_metric_dict = {
-            key: value[0].strip('"')
-            for key, value in metric_dict.items()
-        }
+    clean_metric_dict = _run_fiji_and_read_table(fiji_cmd, outputdir + "table.csv")
+    for idx, (key, value) in enumerate(clean_metric_dict.items()):
+        if idx == 0:
+            continue
+        print(key + ":", value)
 
-        for idx, (key, value) in enumerate (clean_metric_dict.items()):
-            if idx ==0:
-                continue
-            print(key + ":", value)
-        
     return clean_metric_dict
 
 def Ellipsoid_Factor(array,voxel_size,fiji_path,nVectors = 100,vectorIncrement =.435,skipRatio =1,contactSensitivity = 1
@@ -379,29 +371,21 @@ def Ellipsoid_Factor(array,voxel_size,fiji_path,nVectors = 100,vectorIncrement =
                          ", outputdir="+"\""+outputdir+"\"",
                          ", table_csv="+"\""+table_csv+"\""+"\'"])
     
-    b= subprocess.call(fiji_cmd,shell=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    with open(outputdir+f"table.csv", "r", encoding='utf-8') as file:
-        reader = csv.reader(file)
-        metric_dict = {row[0]:row[1:] for row in reader if row and row[0]}
-        clean_metric_dict = {
-            key: value[0].strip('"')
-            for key, value in metric_dict.items()
-        }
+    clean_metric_dict = _run_fiji_and_read_table(fiji_cmd, outputdir + "table.csv")
+    for idx, (key, value) in enumerate(clean_metric_dict.items()):
+        if idx == 0:
+            continue
+        print(key + ":", value)
 
-        for idx, (key, value) in enumerate (clean_metric_dict.items()):
-            if idx ==0:
-                continue
-            print(key + ":", value)
-            
-            output_names = [
-    "img_ef",
-    "img_volume",
-    "img_ab",
-    "img_bc",
-    "img_b",
-    "img_c",
-    "img_flinn_peak_plot"]
-        
+    output_names = [
+"img_ef",
+"img_volume",
+"img_ab",
+"img_bc",
+"img_b",
+"img_c",
+"img_flinn_peak_plot"]
+
     for name in output_names:
         
         optional_dict={}
